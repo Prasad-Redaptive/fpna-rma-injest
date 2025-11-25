@@ -7,7 +7,7 @@ Combines:
 - Backend processing with 3-stage transformation
 - Terminal-style log display in the UI (custom styled, scrollable)
 - Local file storage with versioning
-
+- Databricks OAuth (client_credentials) token fetch + auto-refresh (stores in browser localStorage)
 """
 
 import os
@@ -29,12 +29,23 @@ from io import StringIO
 import threading
 import queue
 import html  # <-- for safe HTML escaping in the custom log window
+import time
+import requests
+import streamlit.components.v1 as components
 
 try:
     from dateutil import parser as _dateparse
     _HAVE_DATEUTIL = True
 except Exception:
     _HAVE_DATEUTIL = False
+
+# OPTIONAL: smooth auto-rerun helper
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAVE_AUTOREFRESH = True
+except Exception:
+    _HAVE_AUTOREFRESH = False
+
 
 # =============================
 # Configuration
@@ -115,6 +126,29 @@ DATEISH_RE = re.compile(
 UNNAMED_CELL_RE = re.compile(r'^\s*Unnamed[:\s].*$', re.IGNORECASE)
 UNNAMED_COLUMN_RE = re.compile(r'^\s*Unnamed:\s*\d+\s*$', re.IGNORECASE)
 
+# ===== Databricks OAuth (Client Credentials) Config =====
+DBX_TOKEN_URL = os.getenv(
+    "DBX_TOKEN_URL",
+    "https://dbc-c686a1d6-b88c.cloud.databricks.com/oidc/v1/token"
+)
+
+# NOTE: Keep this out of code in prod. Set env var DBX_BASIC_B64 = base64("<client_id>:<client_secret>")
+DBX_BASIC_B64 = os.getenv(
+    "DBX_BASIC_B64",
+    # fallback ONLY for local testing; replace in production
+    "NjhjNmY1MmQtZmM0Ny00OTM5LThiZjctZDU5NWE4OGQ1ZGQ1OmRvc2ViYjMxMGJmYjhhOThiN2FkYzcxN2M1NjQ1ZGQ1MjE4ZA=="
+)
+
+# LocalStorage keys (browser side)
+LS_TOKEN_KEY = "dbx_access_token"
+LS_EXP_KEY   = "dbx_access_exp_epoch"
+
+# Small skew so we refresh a bit before real expiry
+EXP_SKEW_SECONDS = 60
+
+def _epoch_now() -> int:
+    return int(time.time())
+
 # =============================
 # Global Logging Setup
 # =============================
@@ -179,6 +213,89 @@ def log_event_csv(log_csv_path, row: dict):
         if not file_exists:
             w.writerow(LOG_COLUMNS)
         w.writerow([row.get(c, "") for c in LOG_COLUMNS])
+
+# =============================
+# Databricks Token Helpers
+# =============================
+
+def fetch_dbx_token_client_credentials(scope: str = "all-apis") -> tuple[str, int] | tuple[None, None]:
+    """
+    Databricks OIDC /token (client_credentials) -> (access_token, exp_epoch).
+    Returns (None, None) on failure. Keeps client secret server-side.
+    """
+    try:
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {DBX_BASIC_B64}"
+        }
+        data = {
+            "grant_type": "client_credentials",
+            "scope": scope
+        }
+        resp = requests.post(DBX_TOKEN_URL, headers=headers, data=data, timeout=(5, 20))
+        if not resp.ok:
+            print(f"[DBX TOKEN] HTTP {resp.status_code}: {resp.text[:300]}")
+            return None, None
+        j = resp.json()
+        tok = j.get("access_token")
+        expires_in = int(j.get("expires_in", 0))
+        if not tok or expires_in <= 0:
+            print("[DBX TOKEN] Missing access_token/expires_in in response")
+            return None, None
+        exp_epoch = _epoch_now() + max(0, expires_in - EXP_SKEW_SECONDS)
+        return tok, exp_epoch
+    except Exception as e:
+        print(f"[DBX TOKEN] Error: {e}")
+        return None, None
+
+def write_token_to_local_storage_js(token: str, exp_epoch: int):
+    """
+    Writes token & expiry into the browser's localStorage.
+    (We never read secrets from browser; this is for convenience in frontends that need the token.)
+    """
+    safe_token = token.replace("\\", "\\\\").replace("`", "\\`")
+    html_js = f"""
+    <script>
+      try {{
+        localStorage.setItem("{LS_TOKEN_KEY}", `{safe_token}`);
+        localStorage.setItem("{LS_EXP_KEY}", String({exp_epoch}));
+        console.log("DBX token stored. Expires @", new Date({exp_epoch}*1000).toISOString());
+      }} catch (e) {{
+        console.error("localStorage write failed:", e);
+      }}
+    </script>
+    """
+    components.html(html_js, height=0, scrolling=False)
+
+def ensure_token_in_session_and_localstorage(scope: str = "all-apis"):
+    """
+    - Check st.session_state for token & expiry
+    - If missing/expired -> fetch new
+    - Mirror to browser localStorage via JS
+    - Return (token, exp_epoch) or (None, None)
+    """
+    if "dbx_token" not in st.session_state:
+        st.session_state.dbx_token = None
+    if "dbx_token_exp" not in st.session_state:
+        st.session_state.dbx_token_exp = 0
+
+    token = st.session_state.dbx_token
+    exp   = int(st.session_state.dbx_token_exp or 0)
+    now = _epoch_now()
+
+    needs_refresh = (not token) or (exp <= now)
+    if needs_refresh:
+        new_tok, new_exp = fetch_dbx_token_client_credentials(scope=scope)
+        if not new_tok:
+            return None, None
+        st.session_state.dbx_token = new_tok
+        st.session_state.dbx_token_exp = new_exp
+        write_token_to_local_storage_js(new_tok, new_exp)
+        return new_tok, new_exp
+
+    # Still valid -> mirror to localStorage (new tab/cleared storage cases)
+    write_token_to_local_storage_js(token, exp)
+    return token, exp
 
 # =============================
 # Backend Helper Functions
@@ -1309,8 +1426,8 @@ def safe_write_csv(df, filename, float_format=None):
         except PermissionError:
             if attempt < max_retries - 1:
                 print(f"Permission denied for {filename}. Please close the file if open in Excel. Retrying in 2 seconds...")
-                import time
-                time.sleep(2)
+                import time as _t
+                _t.sleep(2)
             else:
                 print(f"ERROR: Cannot write to {filename}. Please close the file in Excel or other programs and try again.")
                 return False
@@ -1713,6 +1830,39 @@ def main_frontend():
 
     st.title("📊 Rating & Margins Report Automation")
     st.caption("Upload Excel macro files for automated processing and transformation")
+    # ===== AUTO TOKEN KEEP-ALIVE (refresh while idle) =====
+    KEEPALIVE_SECONDS = 60  # adjust to 30–90s if you like
+
+    # Optional toggle in the sidebar
+    keepalive = st.sidebar.checkbox(
+        "Keep token fresh automatically",
+        value=True,
+        help="Reruns the app every 60s while idle so the token auto-refreshes."
+    )
+
+    # Always check/refresh token on every render
+    tok, exp_epoch = ensure_token_in_session_and_localstorage(scope="all-apis")
+
+    # Trigger rerun only when not actively processing
+    if keepalive and not st.session_state.get("processing_complete", False):
+        if _HAVE_AUTOREFRESH:
+            # Soft rerun (recommended)
+            st_autorefresh(interval=KEEPALIVE_SECONDS * 1000, key="dbx-keepalive")
+        else:
+            # Fallback: hard reload with JS (only when tab is visible)
+            components.html(f"""
+                <script>
+                  const sec = {KEEPALIVE_SECONDS} * 1000;
+                  if (!window.__dbxKeepAlive) {{
+                    window.__dbxKeepAlive = setInterval(() => {{
+                      if (document.visibilityState === 'visible') {{
+                        window.location.reload();
+                      }}
+                    }}, sec);
+                  }}
+                </script>
+            """, height=0)
+    # ===== /AUTO TOKEN KEEP-ALIVE =====
 
     # Global CSS for the scrollable, dark-themed log area
     st.markdown(
@@ -1797,11 +1947,11 @@ def main_frontend():
         target_path = UPLOAD_DIR / stored_name
 
         # Redirect stdout to our terminal output
-        import sys
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = terminal_output
-        sys.stderr = terminal_output
+        import sys as _sys
+        old_stdout = _sys.stdout
+        old_stderr = _sys.stderr
+        _sys.stdout = terminal_output
+        _sys.stderr = terminal_output
 
         try:
             # Save uploaded file
@@ -1810,6 +1960,11 @@ def main_frontend():
 
             st.success(f"✅ File uploaded successfully! Starting processing...")
             
+            # Example: create a requests session with current token (optional)
+            # session = requests.Session()
+            # if st.session_state.get("dbx_token"):
+                # session.headers.update({"Authorization": f"Bearer {st.session_state['dbx_token']}"})
+
             # Process the file
             print(f"Starting processing of: {safe_name}")
             final_files = process_workbook_combined(
@@ -1863,8 +2018,8 @@ def main_frontend():
 
         finally:
             # Restore stdout/stderr
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+            _sys.stdout = old_stdout
+            _sys.stderr = old_stderr
             terminal_output.update_display()
 
     elif process_button and file is None:
