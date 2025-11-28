@@ -3,10 +3,34 @@ command: [
   "-m",
   "streamlit",
   "run",
-  "app.py"
+  "app.py",
+  "--server.port=8080",
+  "--server.address=0.0.0.0"
 ]
 env:
-  - name: 'DATABRICKS_WAREHOUSE_ID'
-    value: 'quoz2bvjy8bl7skl'
-  - name: 'STREAMLIT_GATHER_USAGE_STATS'
-    value: 'false'
+  - name: APP_CATALOG
+    value: "main"
+  - name: APP_SCHEMA  
+    value: "rating_margins"
+  - name: APP_VOLUME
+    value: "uploads_volume"
+  - name: APP_LOG_TABLE
+    value: "upload_log"
+  - name: APP_VERSION_TABLE
+    value: "main.rating_margins.file_versions"
+  - name: APP_MAX_MB
+    value: "50"
+  - name: DBX_TOKEN_URL
+    value: "https://dbc-c686a1d6-b88c.cloud.databricks.com/oidc/v1/token"
+  - name: STREAMLIT_SERVER_HEADLESS
+    value: "true"
+  - name: STREAMLIT_GATHER_USAGE_STATS
+    value: "false"
+  - name: APP_RATING_ANALYSIS_TABLE
+    value: "corpfinance_dev.finance.rating_analysis"
+  - name: APP_SQL_WAREHOUSE_ID
+    value: "d540279f12d10dad"
+  - name: DATABRICKS_HOST
+    value: "dbc-c686a1d6-b88c.cloud.databricks.com"
+  - name: DBX_BASIC_B64
+    value: "REPLACE_WITH_YOUR_BASE64_CLIENTID_COLON_SECRET"

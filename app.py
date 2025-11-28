@@ -2,12 +2,7 @@
 """
 Integrated Frontend + Backend: Rating & Margins Report Automation
 ----------------------------------------------------------------
-Combines:
-- Streamlit frontend for file upload
-- Backend processing with 3-stage transformation
-- Terminal-style log display in the UI (custom styled, scrollable)
-- Local file storage with versioning
-- Databricks OAuth (client_credentials) token fetch + auto-refresh (stores in browser localStorage)
+Databricks App Compatible Version with Fixed Versioning
 """
 
 import os
@@ -17,6 +12,7 @@ import hashlib
 import argparse
 import sys
 import warnings
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -28,10 +24,16 @@ import streamlit as st
 from io import StringIO
 import threading
 import queue
-import html  # <-- for safe HTML escaping in the custom log window
+import html
 import time
 import requests
+
 import streamlit.components.v1 as components
+
+try:
+    from databricks import sql as db_sql
+except ImportError:
+    db_sql = None
 
 try:
     from dateutil import parser as _dateparse
@@ -46,9 +48,8 @@ try:
 except Exception:
     _HAVE_AUTOREFRESH = False
 
-
 # =============================
-# Configuration
+# Configuration from Environment Variables
 # =============================
 
 # Frontend Configuration
@@ -58,7 +59,7 @@ VOLUME    = os.getenv("APP_VOLUME", "uploads_volume")
 LOG_TABLE = os.getenv("APP_LOG_TABLE", "upload_log")
 RAW_DIR   = os.getenv("APP_RAW_DIR", "raw_uploads")
 MAX_MB    = int(os.getenv("APP_MAX_MB", "50"))
-LOCAL_ROOT = Path(os.getenv("APP_LOCAL_STORAGE_ROOT", Path.cwd() / "local_uc"))
+LOCAL_ROOT = Path(os.getenv("APP_LOCAL_STORAGE_ROOT", "/tmp/local_uc"))
 
 # Backend Configuration
 DEFAULT_SHEETS = [
@@ -66,6 +67,15 @@ DEFAULT_SHEETS = [
     "Project Economics",
     "Capex & Audit deals",
 ]
+
+# Table that already has file_version and report_as_of
+RATING_ANALYSIS_TABLE = os.getenv(
+    "APP_RATING_ANALYSIS_TABLE",
+    "corpfinance_dev.finance.rating_analysis"  # or whatever you want as default
+)
+
+DBX_SQL_WAREHOUSE_ID = os.getenv("APP_SQL_WAREHOUSE_ID", "")
+DBX_HOST = os.getenv("DATABRICKS_HOST", "").replace("https://", "").replace("http://", "")
 
 CAPEX_SHEET_ALIASES = [
     "Capex & Audit deals",
@@ -139,6 +149,9 @@ DBX_BASIC_B64 = os.getenv(
     "NjhjNmY1MmQtZmM0Ny00OTM5LThiZjctZDU5NWE4OGQ1ZGQ1OmRvc2ViYjMxMGJmYjhhOThiN2FkYzcxN2M1NjQ1ZGQ1MjE4ZA=="
 )
 
+# Optional: table used for version lookup SQL (you can override via env var)
+VERSION_TABLE = os.getenv("APP_VERSION_TABLE", "main.rating_margins.file_versions")
+
 # LocalStorage keys (browser side)
 LS_TOKEN_KEY = "dbx_access_token"
 LS_EXP_KEY   = "dbx_access_exp_epoch"
@@ -148,6 +161,168 @@ EXP_SKEW_SECONDS = 60
 
 def _epoch_now() -> int:
     return int(time.time())
+
+# =============================
+# Fixed Versioning Logic
+# =============================
+
+class FileVersionManager:
+    """Manage file versioning for uploaded files (by report_as_of date)"""
+    
+    def __init__(self, catalog: str, schema: str, volume: str):
+        self.catalog = catalog
+        self.schema = schema
+        self.volume = volume
+        self.version_file = LOCAL_ROOT / "file_versions.json"
+
+    def get_next_version(self, filename: str, report_date: str | None = None) -> int:
+        """
+        Get next version number for a given report_date.
+
+        Logic:
+        1. Look up latest file_version in DB where report_as_of = report_date
+        2. If not found / error → fall back to local JSON by report_date
+        3. Return base_version + 1
+
+        NOTE: filename is only used for logging; versioning is by report_date.
+        """
+        if not report_date:
+            print(
+                f"[VersionManager] WARNING: get_next_version called without report_date "
+                f"for filename={filename}; defaulting to base_version=0"
+            )
+            base_version = 0
+        else:
+            try:
+                db_version = self._get_version_from_db(report_date)
+                if db_version is not None:
+                    base_version = db_version
+                    print(
+                        f"📊 Using DB base_version={base_version} "
+                        f"for report_as_of={report_date} (filename={filename})"
+                    )
+                else:
+                    base_version = self._get_local_version(report_date)
+                    print(
+                        f"📊 Using local base_version={base_version} "
+                        f"for report_as_of={report_date} (filename={filename})"
+                    )
+            except Exception as e:
+                print(f"⚠️ Could not get version from DB: {e}")
+                base_version = self._get_local_version(report_date)
+                print(
+                    f"📊 Using local base_version={base_version} "
+                    f"for report_as_of={report_date} (filename={filename})"
+                )
+
+        next_version = base_version + 1
+        print(
+            f"[VersionManager] Next version for report_as_of={report_date} "
+            f"(filename={filename}) → {next_version}"
+        )
+        return next_version
+    
+    def _get_version_from_db(self, report_date: str | None = None) -> Optional[int]:
+        """
+        Get latest version from Databricks rating_analysis table
+        using report_as_of = report_date.
+
+        Returns the last version (int) or None if no rows / error.
+        """
+        if not report_date:
+            print("[VersionManager] No report_date passed; skipping DB version lookup.")
+            return None
+
+        conn = get_dbx_sql_connection()
+        if conn is None:
+            return None
+
+        report_date_clean = str(report_date).strip()
+
+        query = f"""
+            SELECT file_version
+            FROM {RATING_ANALYSIS_TABLE}
+            WHERE report_as_of = '{report_date_clean}'
+            ORDER BY file_version DESC
+            LIMIT 1
+        """
+
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                    row = cur.fetchone()
+                    if row is None:
+                        print(f"[VersionManager] No DB version found for report_as_of={report_date_clean}")
+                        return None
+
+                    if isinstance(row, dict):
+                        db_version = row.get("file_version")
+                    else:
+                        db_version = row[0]
+
+                    if db_version is None:
+                        print(f"[VersionManager] file_version is NULL for report_as_of={report_date_clean}")
+                        return None
+
+                    db_version_int = int(db_version)
+                    print(f"[VersionManager] DB base version for report_as_of={report_date_clean}: {db_version_int}")
+                    return db_version_int
+
+        except Exception as e:
+            print(f"[VersionManager] Error querying DB for version: {e}")
+            return None
+    
+    def _get_local_version(self, report_date: str) -> int:
+        """
+        Get local base version for a given report_date from JSON file.
+
+        JSON structure:
+            {
+              "2025-09-26": 2,
+              "2025-10-31": 5,
+              ...
+            }
+        """
+        try:
+            if self.version_file.exists():
+                with open(self.version_file, 'r', encoding="utf-8") as f:
+                    versions = json.load(f)
+                return int(versions.get(report_date, 0))
+        except Exception as e:
+            print(f"⚠️ Could not read local versions: {e}")
+        return 0
+    
+    def save_version(self, filename: str, report_date: str, version: int):
+        """
+        Save *max* version for this report_date into local JSON.
+
+        filename is just logged for traceability.
+        """
+        try:
+            versions: dict[str, int] = {}
+            if self.version_file.exists():
+                with open(self.version_file, 'r', encoding="utf-8") as f:
+                    versions = json.load(f)
+
+            current = int(versions.get(report_date, 0))
+            versions[report_date] = max(current, int(version))
+
+            self.version_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self.version_file, 'w', encoding="utf-8") as f:
+                json.dump(versions, f, indent=2)
+
+            print(
+                f"💾 Saved max version {versions[report_date]} for "
+                f"report_as_of={report_date} (last filename={filename})"
+            )
+        except Exception as e:
+            print(f"⚠️ Warning: Could not save version: {e}")
+
+
+# Initialize version manager
+version_manager = FileVersionManager(CATALOG, SCHEMA, VOLUME)
 
 # =============================
 # Global Logging Setup
@@ -217,6 +392,39 @@ def log_event_csv(log_csv_path, row: dict):
 # =============================
 # Databricks Token Helpers
 # =============================
+
+def get_dbx_sql_connection():
+    """
+    Open a Databricks SQL connection using the OAuth token from
+    fetch_dbx_token_client_credentials() and env config.
+
+    Returns a connection or None on failure.
+    """
+    if db_sql is None:
+        print("[DBX SQL] databricks-sql-connector not available; skipping DB lookup.")
+        return None
+
+    if not DBX_HOST or not DBX_SQL_WAREHOUSE_ID:
+        print("[DBX SQL] Missing DBX_HOST or APP_SQL_WAREHOUSE_ID; skipping DB lookup.")
+        return None
+
+    # You can change scope to "all-apis" if that's what your OAuth supports
+    token, exp_epoch = fetch_dbx_token_client_credentials(scope="sql")
+    if not token:
+        print("[DBX SQL] Could not obtain SQL access token.")
+        return None
+
+    try:
+        conn = db_sql.connect(
+            server_hostname=DBX_HOST,
+            http_path=f"/sql/1.0/warehouses/{DBX_SQL_WAREHOUSE_ID}",
+            access_token=token,
+        )
+        return conn
+    except Exception as e:
+        print(f"[DBX SQL] Connection error: {e}")
+        return None
+
 
 def fetch_dbx_token_client_credentials(scope: str = "all-apis") -> tuple[str, int] | tuple[None, None]:
     """
@@ -689,13 +897,21 @@ def standardize_capex_columns(df: pd.DataFrame, verbose: bool = False) -> pd.Dat
     
     return df
 
-def add_capex_metadata_columns(df: pd.DataFrame, xlsm_path: Path) -> pd.DataFrame:
-    """Add ingestion_date and file_name columns to Capex dataframe."""
+def add_capex_metadata_columns(
+    df: pd.DataFrame,
+    xlsm_path: Path,
+    report_date: str | None,
+    file_version: int,
+) -> pd.DataFrame:
+    """Add ingestion_date, file_name, file_version columns to Capex dataframe."""
     current_time = dt.datetime.now()
     ingestion_date_formatted = current_time.strftime("%m/%d/%Y  %I:%M:%S %p")
+    
     df['ingestion_date'] = ingestion_date_formatted
     df['file_name'] = xlsm_path.name
-    df['file_version'] = 1
+    df['file_version'] = file_version
+    
+    print(f"[Capex] Added metadata columns with version {file_version}")
     return df
 
 
@@ -711,7 +927,9 @@ def export_workbook(
     date_fmt: str,
     prefer_dayfirst: Optional[bool],
     verbose: bool,
-    base_filename: str
+    base_filename: str,
+    report_date: str | None = None,
+    file_version: int | None = None,
 ):
     """Export workbook sheets to CSV files (Script 1 functionality)"""
     try:
@@ -756,9 +974,13 @@ def export_workbook(
         # For Capex sheet: standardize columns and add metadata
         if is_capex:
             df = standardize_capex_columns(df, verbose=verbose)
-            df = add_capex_metadata_columns(df, xlsm_path)
+            if file_version is None:
+                # Fallback: compute one here if somehow not provided
+                file_version = version_manager.get_next_version(xlsm_path.name, report_date)
+            df = add_capex_metadata_columns(df, xlsm_path, report_date, file_version)
             if verbose:
-                print(f"[Capex] Added metadata columns: ingestion_date, file_name, file_version")
+                print(f"[Capex] Added metadata columns with versioning (file_version={file_version})")
+
             
             # Force Net Revenue read as string to prevent date typing
             w2a_rev_check = map_existing_columns(df, [CAPEX_NUMERIC_COLUMN])
@@ -888,15 +1110,20 @@ def export_workbook(
 # =============================
 
 def normalize_to_yyyy_mm_dd(date_like):
-    """Normalize many date shapes to 'YYYY-MM-DD'."""
+    """Normalize many date shapes to 'YYYY-MM-DD'. Return None if not parseable."""
     if pd.isna(date_like):
         return None
     s = str(date_like).strip()
     s = re.sub(r'[\u00A0\u200B]', '', s)
 
+    if s == "":
+        return None
+
+    # Year-only (e.g. "2025")
     if re.fullmatch(r'\d{4}', s):
         return f"{s}-01-01"
 
+    # Already in YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
     if re.fullmatch(r'\d{4}-\d{2}-\d{2}', s):
         return s
     if re.fullmatch(r'\d{4}/\d{2}/\d{2}', s):
@@ -904,6 +1131,7 @@ def normalize_to_yyyy_mm_dd(date_like):
     if re.fullmatch(r'\d{4}\.\d{2}\.\d{2}', s):
         return s.replace('.', '-')
 
+    # Try parsing with different assumptions
     for kwargs in (dict(dayfirst=False, yearfirst=True),
                    dict(dayfirst=True,  yearfirst=True)):
         try:
@@ -914,7 +1142,9 @@ def normalize_to_yyyy_mm_dd(date_like):
         except Exception:
             pass
 
-    return s
+    # If we reached here, this is *not* a proper date
+    return None
+
 
 def format_annual_dates(dates_list):
     """Convert annual dates to ISO date."""
@@ -1092,8 +1322,14 @@ def normalize_numeric_value(cleaned_value, is_percent):
     """Output values kept as-is (no division by 100 for percent values)"""
     return cleaned_value
 
-def transform_rating_analysis_dynamic_columns(csv_file_path, base_filename, ingestion_timestamp=None):
-    """Transform Rating Analysis CSV (Script 2 functionality)"""
+def transform_rating_analysis_dynamic_columns(
+    csv_file_path,
+    base_filename,
+    ingestion_timestamp=None,
+    forced_report_date=None,
+    file_version: int | None = None,
+):
+    """Transform Rating Analysis CSV (Script 2 functionality) with proper versioning"""
     if ingestion_timestamp is None:
         ingestion_timestamp = dt.datetime.now().strftime('%m/%d/%Y %I:%M:%S %p')
 
@@ -1104,18 +1340,29 @@ def transform_rating_analysis_dynamic_columns(csv_file_path, base_filename, inge
     except UnicodeDecodeError:
         try:
             df = pd.read_csv(csv_file_path, header=None, encoding='latin-1')
-        except:
+        except Exception:
             df = pd.read_csv(csv_file_path, header=None, encoding='utf-8', engine='python')
 
     file_name = base_filename + ".xlsm"
-    file_version = 1
+    
+    # Use the precomputed version for this workbook
+    if file_version is None:
+        version = version_manager.get_next_version(file_name, forced_report_date)
+        print(f"[Rating Analysis] WARNING: file_version not provided, computed on the fly = {version}")
+    else:
+        version = file_version
 
-    raw_report_date = df.iloc[1, 3] if len(df) > 1 and pd.notna(df.iloc[1, 3]) else 'Unknown'
+
+    if forced_report_date is not None:
+        raw_report_date = forced_report_date
+    else:
+        raw_report_date = df.iloc[1, 3] if len(df) > 1 and pd.notna(df.iloc[1, 3]) else 'Unknown'
+
     report_date = format_report_date(raw_report_date)
     print(f"Report date: {raw_report_date} -> {report_date}")
+    print(f"File version: {version}")
     print(f"Input file dimensions: {df.shape[0]} rows x {df.shape[1]} columns")
     print(f"File name: {file_name}")
-    print(f"File version: {file_version}")
 
     print("\n🔍 Scanning for table sections...")
     sections = find_table_sections(df)
@@ -1180,7 +1427,7 @@ def transform_rating_analysis_dynamic_columns(csv_file_path, base_filename, inge
                     'report_as_of': report_date,
                     'ingestion_date': ingestion_timestamp,
                     'file_name': file_name,
-                    'file_version': file_version,
+                    'file_version': version,
                     'table_category': section['table_category'],
                     'source_table_name': section['source_table_name'],
                     'category': section['category_type'],
@@ -1225,6 +1472,97 @@ def transform_rating_analysis_dynamic_columns(csv_file_path, base_filename, inge
     print(f"   • Final output records: {len(result_df):,}")
 
     return result_df
+
+# NEW: Helper to extract "Report as of" directly from the Rating Analysis sheet once
+def extract_report_as_of_from_workbook(xlsm_path: Path) -> Optional[str]:
+    """
+    Open the XLSM, find the 'Rating Analysis' sheet, and extract the
+    'Report as of' date once, before any heavy processing.
+
+    Strategy:
+    - Look for a cell whose text contains 'report as of' (label)
+    - On that row, scan a few cells to the right for something parseable as a date
+    - Fall back to scanning the small top block for any cell that looks like a date
+    """
+    try:
+        xls = pd.ExcelFile(xlsm_path, engine="openpyxl")
+    except Exception as e:
+        print(f"[Report as of] Failed to open workbook '{xlsm_path}': {e}")
+        return None
+
+    desired_sheet = None
+    for s in xls.sheet_names:
+        if _canon_sheet_name(s) == _canon_sheet_name("Rating Analysis"):
+            desired_sheet = s
+            break
+
+    if desired_sheet is None:
+        print("[Report as of] 'Rating Analysis' sheet not found in workbook.")
+        return None
+
+    try:
+        # Read a small top slice; header=None so we see raw cells
+        df = pd.read_excel(xls, sheet_name=desired_sheet, engine="openpyxl",
+                           header=None, nrows=10)
+    except Exception as e:
+        print(f"[Report as of] Error reading Rating Analysis sheet: {e}")
+        return None
+
+    # 1) Find the label "report as of" (case-insensitive)
+    label_positions = []
+    for r in range(df.shape[0]):
+        for c in range(df.shape[1]):
+            val = df.iat[r, c]
+            if pd.isna(val):
+                continue
+            s = str(val).strip().lower()
+            if "report as of" in s:
+                label_positions.append((r, c))
+
+    # Try each label position: look to the right on same row for a parseable date
+    for (r, c) in label_positions:
+        for offset in range(1, 5):  # look at up to 4 cells to the right
+            cc = c + offset
+            if cc >= df.shape[1]:
+                break
+            cell_val = df.iat[r, cc]
+            if pd.isna(cell_val) or str(cell_val).strip() == "":
+                continue
+            candidate = normalize_to_yyyy_mm_dd(cell_val)
+            if candidate is not None:
+                print(f"[Report as of] Found label at ({r},{c}) and date {cell_val!r} -> {candidate!r}")
+                return candidate
+
+    # 2) Fallback: scan entire small block for any parseable date
+    for r in range(df.shape[0]):
+        for c in range(df.shape[1]):
+            val = df.iat[r, c]
+            if pd.isna(val):
+                continue
+            candidate = normalize_to_yyyy_mm_dd(val)
+            if candidate is not None:
+                print(f"[Report as of] Fallback found date {val!r} -> {candidate!r} at ({r},{c})")
+                return candidate
+
+    print("[Report as of] Could not find a valid report date.")
+    return None
+
+
+# Optional: helper to build the version lookup SQL using the "Report as of" date
+def build_version_lookup_sql(report_as_of_date: str, table_name: str = RATING_ANALYSIS_TABLE) -> str:
+    """
+    Build an example SQL statement that can be used to find the correct version
+    from the rating_analysis table, using report_as_of.
+    """
+    sql_stmt = f"""
+SELECT file_version
+FROM {table_name}
+WHERE report_as_of = '{report_as_of_date}'
+ORDER BY file_version DESC
+LIMIT 1;
+""".strip()
+    return sql_stmt
+
 
 # =============================
 # Script 3 - Project Economics Processing
@@ -1506,12 +1844,19 @@ def get_details_column_mapping():
         'End Column - Cash Inflow (NTP)': 'end_column_cash_inflow_ntp'
     }
 
-def add_common_columns(df, original_xlsm_filename):
-    """Add common columns to dataframe"""
+def add_common_columns(
+    df,
+    original_xlsm_filename,
+    report_date: str | None,
+    file_version: int,
+):
+    """Add common columns to dataframe with shared file_version."""
     df['ingestion_date'] = dt.datetime.now().strftime('%m/%d/%Y  %I:%M:%S %p')
-    # normalize to bare filename (no directories), so it matches transformed_rating_analysis.csv exactly
-    df['file_name'] = Path(original_xlsm_filename).name
-    df['file_version'] = 1
+    
+    filename = Path(original_xlsm_filename).name
+    df['file_name'] = filename
+    df['file_version'] = file_version
+    print(f"[Project Economics] Added metadata columns with version {file_version}")
     return df
 
 
@@ -1526,7 +1871,12 @@ def map_columns(df, column_mapping):
     
     return df
 
-def process_project_economics(input_file, base_filename):
+def process_project_economics(
+    input_file,
+    base_filename,
+    report_date: str | None = None,
+    file_version: int | None = None,
+):
     """Process Project Economics CSV into two files (Script 3 functionality)"""
     # Create output file names with base filename and version
     details_output_file = f"{base_filename}_Project Economics Details.csv"
@@ -1683,11 +2033,17 @@ def process_project_economics(input_file, base_filename):
     details_mapping = get_details_column_mapping()
     project_details = map_columns(project_details, details_mapping)
     project_details = convert_mapped_integer_columns(project_details)
-    project_details = add_common_columns(project_details, original_xlsm_filename)  # Pass the filename
+
+    if file_version is None:
+        file_version = version_manager.get_next_version(original_xlsm_filename, report_date)
+        print(f"[Project Economics] WARNING: file_version not provided, computed on the fly = {file_version}")
+
+    project_details = add_common_columns(project_details, original_xlsm_filename, report_date, file_version)
     
     cash_flow_mapping = get_cash_flow_column_mapping()
     project_cash_flow = map_columns(project_cash_flow, cash_flow_mapping)
-    project_cash_flow = add_common_columns(project_cash_flow, original_xlsm_filename)  # Pass the filename
+    project_cash_flow = add_common_columns(project_cash_flow, original_xlsm_filename, report_date, file_version)
+
 
     print("\nWriting output files with numeric formatting...")
 
@@ -1720,6 +2076,8 @@ def process_workbook_combined(
 ):
     """
     Combined processing function that:
+    0. Extracts 'Report as of' from Rating Analysis sheet once
+       and builds a SQL version-lookup statement.
     1. Exports 3 sheets from XLSM to CSV
     2. Transforms Rating Analysis CSV 
     3. Processes Project Economics CSV into two files
@@ -1731,7 +2089,24 @@ def process_workbook_combined(
     
     # Extract base filename from input file (without extension)
     base_filename = xlsm_path.stem
-    
+
+    # Step 0: Look into Rating Analysis sheet once and get "Report as of"
+    print(f"\n🕒 STEP 0: Extracting 'Report as of' from Rating Analysis sheet in {xlsm_path.name}")
+    report_as_of_date = extract_report_as_of_from_workbook(xlsm_path)
+    if report_as_of_date:
+        print(f"[Report as of] Using date: {report_as_of_date}")
+        sql_stmt = build_version_lookup_sql(report_as_of_date, RATING_ANALYSIS_TABLE)
+        print("\n[Version lookup] Example SQL to find the correct version:")
+        print(sql_stmt)
+    else:
+        print("[Report as of] WARNING: Could not determine report date; version lookup SQL not generated.")
+
+    # Compute a single version for this workbook & report date
+    file_name_for_version = xlsm_path.name
+    file_version = version_manager.get_next_version(file_name_for_version, report_as_of_date)
+    print(f"📊 Using file_version={file_version} for all outputs for report_as_of={report_as_of_date}")
+
+
     # Step 1: Export sheets from XLSM (Script 1)
     print(f"\n📁 STEP 1: Exporting sheets from XLSM workbook: {xlsm_path.name}")
     csv_files = export_workbook(
@@ -1741,8 +2116,11 @@ def process_workbook_combined(
         date_fmt=date_fmt,
         prefer_dayfirst=prefer_dayfirst,
         verbose=verbose,
-        base_filename=base_filename
+        base_filename=base_filename,
+        report_date=report_as_of_date,
+        file_version=file_version,
     )
+
     
     # Step 2: Transform Rating Analysis CSV (Script 2)
     print("\n📊 STEP 2: Transforming Rating Analysis CSV...")
@@ -1754,9 +2132,12 @@ def process_workbook_combined(
     
     if rating_analysis_path and rating_analysis_path.exists():
         transformed_rating = transform_rating_analysis_dynamic_columns(
-            str(rating_analysis_path), 
-            base_filename
+            str(rating_analysis_path),
+            base_filename,
+            forced_report_date=report_as_of_date,
+            file_version=file_version,
         )
+
         
         # Save transformed rating analysis with base filename and version
         rating_output_path = out_dir / f"{base_filename}_rating_analysis_sheet.csv"
@@ -1782,9 +2163,12 @@ def process_workbook_combined(
     
     if project_economics_path and project_economics_path.exists():
         details_path, cash_flow_path = process_project_economics(
-            str(project_economics_path), 
-            base_filename=str(out_dir / base_filename)
+            str(project_economics_path),
+            base_filename=str(out_dir / base_filename),
+            report_date=report_as_of_date,
+            file_version=file_version,
         )
+
         
         if details_path and cash_flow_path:
             print(f"✅ Saved Project Economics Details: {details_path}")
@@ -1815,10 +2199,14 @@ def process_workbook_combined(
     print("=" * 80)
     print("FINAL OUTPUT FILES:")
     for file_type, file_path in final_files.items():
-        status = "✅" if file_path and file_path.exists() else "❌"
+        status = "✅" if file_path and Path(file_path).exists() else "❌"
         print(f"  {status} {file_type}: {file_path}")
-    
+        # Persist version info for this report date
+    if report_as_of_date:
+        version_manager.save_version(file_name_for_version, report_as_of_date, file_version)
+
     return final_files
+
 
 # =============================
 # Frontend UI
@@ -1831,7 +2219,7 @@ def main_frontend():
     st.title("📊 Rating & Margins Report Automation")
     st.caption("Upload Excel macro files for automated processing and transformation")
     # ===== AUTO TOKEN KEEP-ALIVE (refresh while idle) =====
-    KEEPALIVE_SECONDS = 60  # adjust to 30–90s if you like
+    KEEPALIVE_SECONDS = 180  # adjust to 30–90s if you like
 
     # Optional toggle in the sidebar
     keepalive = st.sidebar.checkbox(
@@ -1844,24 +2232,24 @@ def main_frontend():
     tok, exp_epoch = ensure_token_in_session_and_localstorage(scope="all-apis")
 
     # Trigger rerun only when not actively processing
-    if keepalive and not st.session_state.get("processing_complete", False):
+    # Only auto-refresh when we are NOT in the middle of processing
+    if keepalive and not st.session_state.get("processing_in_progress", False):
         if _HAVE_AUTOREFRESH:
-            # Soft rerun (recommended)
             st_autorefresh(interval=KEEPALIVE_SECONDS * 1000, key="dbx-keepalive")
         else:
-            # Fallback: hard reload with JS (only when tab is visible)
-            components.html(f"""
+            components.html("""
                 <script>
-                  const sec = {KEEPALIVE_SECONDS} * 1000;
-                  if (!window.__dbxKeepAlive) {{
-                    window.__dbxKeepAlive = setInterval(() => {{
-                      if (document.visibilityState === 'visible') {{
+                const sec = 60000;
+                if (!window.__dbxKeepAlive) {
+                    window.__dbxKeepAlive = setInterval(() => {
+                    if (document.visibilityState === 'visible') {
                         window.location.reload();
-                      }}
-                    }}, sec);
-                  }}
+                    }
+                    }, sec);
+                }
                 </script>
             """, height=0)
+
     # ===== /AUTO TOKEN KEEP-ALIVE =====
 
     # Global CSS for the scrollable, dark-themed log area
@@ -1901,6 +2289,18 @@ def main_frontend():
     if 'uploaded_file_name' not in st.session_state:
         st.session_state.uploaded_file_name = None
 
+    # NEW: track whether we are currently processing a file
+    if 'processing_in_progress' not in st.session_state:
+        st.session_state.processing_in_progress = False
+
+    # Display current configuration
+    with st.expander("📋 Current Configuration"):
+        st.write(f"**Catalog:** {CATALOG}")
+        st.write(f"**Schema:** {SCHEMA}")
+        st.write(f"**Volume:** {VOLUME}")
+        st.write(f"**Version Table:** {VERSION_TABLE}")
+        st.write(f"**Max File Size:** {MAX_MB} MB")
+
     # File upload section
     col1, col2 = st.columns([2, 1])
     
@@ -1926,6 +2326,7 @@ def main_frontend():
         st.session_state.download_files = None
         st.session_state.processing_complete = False
         st.session_state.uploaded_file_name = None
+        st.session_state.processing_in_progress = True
 
         # Validate file
         if not file.name.lower().endswith(".xlsm"):
@@ -1960,11 +2361,6 @@ def main_frontend():
 
             st.success(f"✅ File uploaded successfully! Starting processing...")
             
-            # Example: create a requests session with current token (optional)
-            # session = requests.Session()
-            # if st.session_state.get("dbx_token"):
-                # session.headers.update({"Authorization": f"Bearer {st.session_state['dbx_token']}"})
-
             # Process the file
             print(f"Starting processing of: {safe_name}")
             final_files = process_workbook_combined(
@@ -1990,6 +2386,7 @@ def main_frontend():
             st.session_state.download_files = final_files
             st.session_state.processing_complete = True
             st.session_state.uploaded_file_name = safe_name
+            
 
             # Display results
             st.success("🎉 Processing completed successfully!")
@@ -2018,6 +2415,7 @@ def main_frontend():
 
         finally:
             # Restore stdout/stderr
+            st.session_state.processing_in_progress = False 
             _sys.stdout = old_stdout
             _sys.stderr = old_stderr
             terminal_output.update_display()
@@ -2119,7 +2517,7 @@ def main_cli():
     )
 
     # Summary
-    successful_files = sum(1 for path in final_files.values() if path and path.exists())
+    successful_files = sum(1 for path in final_files.values() if path and Path(path).exists())
     print(f"\n📈 SUMMARY: {successful_files}/4 files generated successfully")
 
 # =============================
@@ -2127,9 +2525,12 @@ def main_cli():
 # =============================
 
 if __name__ == "__main__":
-    # Streamlit mode: launched via `streamlit run` or `python -m streamlit run`
-    # CLI mode: launched via `python integrated_app.py input.xlsm`
+    # Create necessary directories
+    LOCAL_ROOT.mkdir(parents=True, exist_ok=True)
+    
+    # Run the app
     if len(sys.argv) == 1:
         main_frontend()
     else:
+        # CLI mode for testing
         main_cli()
